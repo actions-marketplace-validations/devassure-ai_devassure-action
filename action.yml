@@ -58,13 +58,23 @@ inputs:
   minimum_score:
     description: Minimum acceptable score for validation.
     required: false
-    default: "75"
+    default: 75
   workers:
-    description: Worker count for test/run commands. Must be an integer greater than 0.
+    description: Worker count for test/run. Omit or set to 0 to use the project default; when set above 0, must be a positive integer.
     required: false
   environment:
     description: Environment to be used for test execution (defaults to default).
     required: false
+  verbose:
+    description: Enable verbose output for DevAssure commands (true/false).
+    required: false
+  debug:
+    description: Enable debug output for DevAssure commands (true/false).
+    required: false
+  commit_tests:
+    description: Commit generated DevAssure tests back to the branch (true/false). Requires contents write permission.
+    required: false
+    default: "false"
 
 outputs:
   archive_path:
@@ -107,7 +117,7 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        devassure version
+        devassure version --no-ui
 
     - name: Resolve and configure token
       shell: bash
@@ -127,13 +137,17 @@ runs:
           exit 1
         fi
 
-        devassure add-token "$resolved_token"
+        devassure add-token "$resolved_token" --no-ui
 
     - name: Validate git checkout for DevAssure
       if: ${{ inputs.command == 'test' }}
       shell: bash
       run: |
         set -e
+
+        # Must run before any git command: container/self-hosted runners often mount the
+        # workspace with a different uid, which makes Git refuse the repo ("dubious ownership").
+        git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
         if [ ! -d .git ]; then
           echo "::error::DevAssure requires a checked out git repository. Add actions/checkout@v4 before this action."
@@ -160,8 +174,6 @@ runs:
         DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       run: |
         set -euo pipefail
-
-        git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
         fetch_branch="$DEFAULT_BRANCH"
         if [ -n "$INPUT_TARGET" ]; then
@@ -194,6 +206,8 @@ runs:
         INPUT_SESSION_ID: ${{ inputs.session_id }}
         INPUT_WORKERS: ${{ inputs.workers }}
         INPUT_ENVIRONMENT: ${{ inputs.environment }}
+        INPUT_VERBOSE: ${{ inputs.verbose }}
+        INPUT_DEBUG: ${{ inputs.debug }}
       run: |
         set -euo pipefail
 
@@ -207,7 +221,7 @@ runs:
             ;;
         esac
 
-        cmd="devassure $command_name"
+        cmd="devassure $command_name --no-ui"
 
         add_arg() {
           local arg_name="$1"
@@ -217,15 +231,34 @@ runs:
           fi
         }
 
+        add_verbose_arg() {
+          if [ "${INPUT_VERBOSE:-}" = "true" ]; then
+            cmd="$cmd --verbose"
+          fi
+        }
+
+        add_debug_arg() {
+          if [ "${INPUT_DEBUG:-}" = "true" ]; then
+            cmd="$cmd --debug"
+          fi
+        }
+
+        effective_workers="${INPUT_WORKERS:-}"
+        if [ "$effective_workers" = "0" ]; then
+          effective_workers=""
+        fi
+
         case "$command_name" in
           setup)
+            add_verbose_arg
+            add_debug_arg
             ;;
           test)
             resolved_headless="$INPUT_HEADLESS"
             if [ -z "$resolved_headless" ]; then
               resolved_headless="true"
             fi
-            if [ -n "$INPUT_WORKERS" ]; then
+            if [ -n "${INPUT_WORKERS:-}" ] && [ "${INPUT_WORKERS}" != "0" ]; then
               if ! [[ "$INPUT_WORKERS" =~ ^[0-9]+$ ]] || [ "$INPUT_WORKERS" -le 0 ]; then
                 echo "Error: workers must be an integer greater than 0. Received '$INPUT_WORKERS'." >&2
                 exit 1
@@ -236,16 +269,18 @@ runs:
             add_arg "target" "$INPUT_TARGET"
             add_arg "commit_id" "$INPUT_COMMIT_ID"
             add_arg "url" "$INPUT_URL"
-            add_arg "workers" "$INPUT_WORKERS"
+            add_arg "workers" "$effective_workers"
             add_arg "environment" "$INPUT_ENVIRONMENT"
             cmd="$cmd --headless=\"${resolved_headless}\""
+            add_verbose_arg
+            add_debug_arg
             ;;
           run)
             resolved_headless="$INPUT_HEADLESS"
             if [ -z "$resolved_headless" ]; then
               resolved_headless="true"
             fi
-            if [ -n "$INPUT_WORKERS" ]; then
+            if [ -n "${INPUT_WORKERS:-}" ] && [ "${INPUT_WORKERS}" != "0" ]; then
               if ! [[ "$INPUT_WORKERS" =~ ^[0-9]+$ ]] || [ "$INPUT_WORKERS" -le 0 ]; then
                 echo "Error: workers must be an integer greater than 0. Received '$INPUT_WORKERS'." >&2
                 exit 1
@@ -258,9 +293,11 @@ runs:
             add_arg "priority" "$INPUT_PRIORITY"
             add_arg "folder" "$INPUT_FOLDER"
             add_arg "url" "$INPUT_URL"
-            add_arg "workers" "$INPUT_WORKERS"
+            add_arg "workers" "$effective_workers"
             add_arg "environment" "$INPUT_ENVIRONMENT"
             cmd="$cmd --headless=\"${resolved_headless}\""
+            add_verbose_arg
+            add_debug_arg
             ;;
           summary)
             if [ -n "$INPUT_SESSION_ID" ]; then
@@ -268,15 +305,19 @@ runs:
             else
               cmd="$cmd --last"
             fi
+            add_verbose_arg
+            add_debug_arg
             ;;
           archive|archive-report)
             command_name="archive-report"
-            cmd="devassure $command_name"
+            cmd="devassure $command_name --no-ui"
             if [ -n "$INPUT_SESSION_ID" ]; then
               cmd="$cmd --session_id=\"$INPUT_SESSION_ID\""
             else
               cmd="$cmd --last"
             fi
+            add_verbose_arg
+            add_debug_arg
             ;;
         esac
 
@@ -287,39 +328,81 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        devassure summary --last
+        devassure summary --last --no-ui
+
+    - name: Create artifacts directory for test/run
+      if: ${{ inputs.command == 'test' || inputs.command == 'run' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        artifact_dir="$(pwd -P)/.devassure-artifacts"
+        mkdir -p "$artifact_dir"
+        echo "DEVASSURE_ARTIFACTS_DIR=$artifact_dir" >> "$GITHUB_ENV"
+
+    - name: Export JUnit XML report for test/run
+      if: ${{ inputs.command == 'test' || inputs.command == 'run' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        export_dir="${DEVASSURE_ARTIFACTS_DIR:?DEVASSURE_ARTIFACTS_DIR is not set}"
+        cmd=(devassure export-report --output-dir "$export_dir" --last --format junit-xml --no-ui)
+        if [ "${INPUT_VERBOSE:-}" = "true" ]; then
+          cmd+=(--verbose)
+        fi
+        if [ "${INPUT_DEBUG:-}" = "true" ]; then
+          cmd+=(--debug)
+        fi
+        printf 'Running:'
+        printf ' %q' "${cmd[@]}"
+        printf '\n'
+        "${cmd[@]}"
 
     - name: Archive report for test/run
       id: archive_report
       if: ${{ (inputs.command == 'test' || inputs.command == 'run') && inputs.archive != 'false' }}
       shell: bash
+      env:
+        INPUT_VERBOSE: ${{ inputs.verbose }}
+        INPUT_DEBUG: ${{ inputs.debug }}
       run: |
         set -euo pipefail
 
-        archive_log_file="$(mktemp)"
-        devassure archive-report --last --output-dir "$PWD" | tee "$archive_log_file"
-
-        archive_path="$(awk -F 'Test reports are archived in ' '/Test reports are archived in / { print $2 }' "$archive_log_file" | awk 'NF { last = $0 } END { print last }')"
-
-        if [ -z "$archive_path" ]; then
-          echo "Error: Could not parse archived report path from devassure output." >&2
-          exit 1
+        archive_dir="${DEVASSURE_ARTIFACTS_DIR:?DEVASSURE_ARTIFACTS_DIR is not set}"
+        cmd=(devassure archive-report --last --output-dir "$archive_dir" --no-ui)
+        if [ "${INPUT_VERBOSE:-}" = "true" ]; then
+          cmd+=(--verbose)
         fi
-
-        if [ ! -e "$archive_path" ]; then
-          echo "Error: Parsed archive path does not exist: $archive_path" >&2
-          exit 1
+        if [ "${INPUT_DEBUG:-}" = "true" ]; then
+          cmd+=(--debug)
         fi
+        "${cmd[@]}"
 
-        echo "archive_path=$archive_path" >> "$GITHUB_OUTPUT"
+    - name: Publish test report
+      if: ${{ inputs.command == 'test' || inputs.command == 'run' }}
+      uses: dorny/test-reporter@v3
+      with:
+        name: JUnit Tests
+        path: .devassure-artifacts/*.xml
+        reporter: java-junit
+        fail-on-error: false
+        fail-on-empty: false
+
+    - name: List artifacts
+      if: ${{ inputs.command == 'test' || inputs.command == 'run' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        ls -la .devassure-artifacts/
 
     - name: Upload archived report
-      if: ${{ steps.archive_report.outputs.archive_path != '' }}
+      if: ${{ inputs.command == 'test' || inputs.command == 'run' }}
       uses: actions/upload-artifact@v4
       with:
         name: devassure-report
-        path: ${{ steps.archive_report.outputs.archive_path }}
-        if-no-files-found: error
+        path: ${{ github.workspace }}/.devassure-artifacts
+        if-no-files-found: warn
+        include-hidden-files: true
 
     - name: Validate minimum score for test/run
       if: ${{ inputs.command == 'test' || inputs.command == 'run' }}
@@ -341,7 +424,7 @@ runs:
         fi
 
         summary_log_file="$(mktemp)"
-        devassure summary --last | tee "$summary_log_file"
+        devassure summary --last --no-ui | tee "$summary_log_file"
 
         score_value="$(awk -F 'score:' '/score:/ { print $2; exit }' "$summary_log_file" | xargs)"
 
@@ -364,3 +447,21 @@ runs:
           echo "Test score '$score_value' is less than the minumum expected score ($minimum_score)" >&2
           exit 1
         fi
+    
+    - name: Commit generated DevAssure tests
+      if: always() && inputs.commit_tests == 'true' && inputs.command == 'test' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      shell: bash
+      run: |
+        git config --global --add safe.directory "$GITHUB_WORKSPACE"
+        git config user.name "devassure[bot]"
+        git config user.email "devassure[bot]@users.noreply.github.com"
+        git add .devassure/tests
+        if git diff --cached --quiet; then
+          echo "No DevAssure test changes to commit"
+          exit 0
+        fi
+        git commit -m "chore: add DevAssure generated tests [skip actions]"
+        git push origin HEAD:${{ github.head_ref || github.ref_name }} || {
+          echo "::error::git push failed. Ensure your workflow has 'permissions: contents: write' to allow pushing commits."
+          exit 1
+        }
